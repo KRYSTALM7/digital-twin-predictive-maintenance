@@ -1,0 +1,7 @@
+google-genai
+tensorflow
+simpy
+numpy
+python-dotenv
+
+

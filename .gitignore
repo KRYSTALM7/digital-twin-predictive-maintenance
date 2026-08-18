@@ -1,0 +1,45 @@
+# Environment
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+pymc-dev/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+.mypy_cache/
+
+# Generated outputs
+outputs/
+
+# Generated datasets
+data/processed/
+
+# Project planning
+Pre-Submission_Checklist.md
