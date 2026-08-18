@@ -1,5 +1,7 @@
 # CNC Spindle Digital Twin - Predictive Maintenance System
 
+**Authors**: Sujan Kumar MV, Ganesh Khekare
+
 A comprehensive digital twin implementation for CNC (Computer Numerical Control) spindle predictive maintenance using hybrid deep learning models. This system combines discrete-event simulation, LSTM-based time series forecasting, and autoencoder-based anomaly detection to predict equipment failures before they occur.
 
 ## Overview
@@ -66,39 +68,15 @@ This project simulates a CNC spindle's operational lifecycle and uses machine le
 digital_twin/
 ├── data/
 │   ├── raw/                          # Raw simulation output
-│   │   └── simulated_spindle_data.csv
 │   └── processed/                    # Preprocessed with anomalies
-│       └── spindle_data_with_anomalies.csv
-│
 ├── src/
-│   ├── simulation/
-│   │   └── simpy_simulation.py       # CNC spindle discrete-event sim
-│   ├── preprocessing/
-│   │   └── data_preprocessor.py      # Data cleaning & anomaly injection
-│   ├── models/
-│   │   ├── lstm_forecast.py          # Time-series forecasting model
-│   │   └── autoencoder.py            # Reconstruction-based detector
-│   └── feedback/
-│       ├── feedback_loop.py          # Real-time decision engine
-│       ├── detection_and_metrics.py  # Evaluation pipeline
-│       └── compute_metrics.py        # Metric calculation utilities
-│
-├── scripts/
-│   ├── test_autoencoder.py           # Quick autoencoder test
-│   ├── test_lstm_prediction.py       # Quick LSTM test
-│   └── visualization.py              # Plot detection results
-│
+│   ├── simulation/                   # CNC spindle discrete-event simulation
+│   ├── preprocessing/                # Data cleaning & anomaly injection
+│   ├── models/                       # LSTM & Autoencoder models
+│   └── feedback/                     # Detection pipeline & metrics
+├── scripts/                          # Test & visualization scripts
 ├── outputs/                          # Trained models & results
-│   ├── lstm_model.h5
-│   ├── lstm_scaler.npz
-│   ├── autoencoder_model.h5
-│   ├── autoencoder_meta.npz
-│   ├── detection_results.csv
-│   └── feedback_log.csv
-│
-├── .env                              # API keys (GEMINI_API_KEY)
-├── requirements.txt
-└── Pre-Submission_Checklist.md       # Academic paper submission guide
+└── requirements.txt
 ```
 
 ## Installation
@@ -113,7 +91,7 @@ digital_twin/
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/KRYSTALM7/digital-twin-predictive-maintenance.git
 cd digital_twin
 ```
 
@@ -122,18 +100,17 @@ cd digital_twin
 pip install -r requirements.txt
 ```
 
-3. Set up environment variables:
-Create a `.env` file in the project root:
+3. Set up environment variables (optional):
+```bash
+# Create .env file
+echo "GEMINI_API_KEY=your_api_key_here" > .env
 ```
-GEMINI_API_KEY=your_api_key_here
-```
+
 *Note: The system falls back to random anomaly injection if no API key is provided.*
 
-## Usage
+## Quick Start
 
-### Complete Pipeline (Recommended)
-
-Run the entire workflow in sequence:
+Run the complete pipeline:
 
 ```bash
 # 1. Generate simulated sensor data
@@ -142,64 +119,33 @@ python -m src.simulation.simpy_simulation
 # 2. Preprocess and inject anomalies
 python -m src.preprocessing.data_preprocessor
 
-# 3. Train models (LSTM + Autoencoder)
+# 3. Train models
 python -m src.models.lstm_forecast
 python -m src.models.autoencoder
 
-# 4. Run detection and compute metrics
+# 4. Run detection and evaluation
 python -m src.feedback.detection_and_metrics
 
-# 5. Run feedback loop for real-time decisions
+# 5. Generate real-time feedback decisions
 python -m src.feedback.feedback_loop
 ```
 
-### Individual Components
+## Technical Highlights
 
-**Simulation Only:**
-```python
-from src.simulation.simpy_simulation import run_simulation
+### Models
+- **LSTM Forecaster**: Time-series prediction with 64 LSTM units for vibration anomaly detection
+- **Autoencoder**: Reconstruction-based detection (16→8→2→8→16) for temperature anomaly detection
+- **Hybrid Detector**: OR-logic fusion for comprehensive anomaly detection
 
-run_simulation(
-    duration=1000.0,
-    mean_time_to_failure=300.0,
-    preventive_maintenance_interval=200.0
-)
-```
+### Data Pipeline
+- Time-ordered 70/30 train/test split to prevent data leakage
+- Thresholds calibrated on clean training data only
+- Gemini API integration for realistic anomaly injection
 
-**Preprocessing with Custom Anomaly Method:**
-```python
-from src.preprocessing.data_preprocessor import preprocess_data
-
-# Use Gemini (default)
-preprocess_data(anomaly_method="genai")
-
-# Use random injection
-preprocess_data(anomaly_method="random")
-```
-
-**Anomaly Detection:**
-```python
-from src.models.autoencoder import detect_anomalies
-import numpy as np
-
-# Sample data: [temperature, vibration, current]
-sample = np.array([[70.0, 0.02, 10.0]])
-result = detect_anomalies(sample)
-
-print(f"Anomaly detected: {result['mask'][0]}")
-print(f"Reconstruction error: {result['errors'][0]:.4f}")
-```
-
-**LSTM Forecasting:**
-```python
-from src.models.lstm_forecast import predict_lstm
-import numpy as np
-
-# Window of 20 timesteps
-window = np.random.rand(20, 3)  # [temperature, vibration, current]
-prediction = predict_lstm(window)
-print(f"Next timestep prediction: {prediction}")
-```
+### Metrics
+- Precision, Recall, F1-score, Accuracy
+- Mean Time to Detect (MTTD)
+- Evaluated on test split only for fair assessment
 
 ## Data Description
 
@@ -282,8 +228,7 @@ Results are saved to `outputs/detection_results.csv` with per-row predictions an
 - Sanity bounds (3-8°C drift, 3-5× vibration factor) prevent unrealistic LLM suggestions
 - Falls back to random injection if API unavailable
 
-## Reproducibility
-
+### Reproducibility
 - Random seed set to `42` in preprocessing for deterministic anomaly placement
 - All model training uses fixed random initialization
 - SimPy simulation uses exponential distribution for failure times (pseudo-random, reproducible with seed)
@@ -296,24 +241,6 @@ Results are saved to `outputs/detection_results.csv` with per-row predictions an
 - `outputs/autoencoder_model.h5`: Trained autoencoder weights
 - `outputs/*_scaler.npz`: Normalization parameters for inference
 
-## Academic Context
-
-This project includes a `Pre-Submission_Checklist.md` tailored for academic paper submissions in predictive maintenance and digital twin research. Key considerations:
-
-- Justification of all model architectures and hyperparameters
-- Reproducibility requirements (dataset source, preprocessing steps, training config)
-- Statistical validation of reported improvements
-- State-of-the-art comparisons
-- Ablation studies for hybrid models
-
-## Future Enhancements
-
-- Real-time streaming data ingestion
-- Additional sensor modalities (acoustic, power quality)
-- Reinforcement learning for adaptive maintenance scheduling
-- Transfer learning for cross-equipment deployment
-- Explainable AI (SHAP, attention weights) for anomaly interpretation
-
 ## Dependencies
 
 Core dependencies (see `requirements.txt`):
@@ -325,19 +252,14 @@ Core dependencies (see `requirements.txt`):
 
 ## License
 
-[Specify your license here]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Contributing
 
 Contributions are welcome! Please ensure:
 1. All tests pass before submitting PRs
 2. Code follows existing style conventions
-3. New features include appropriate unit tests
-4. Documentation is updated for API changes
-
-## Contact
-
-[Your contact information or project maintainer details]
+3. Documentation is updated for API changes
 
 ## Citation
 
@@ -346,9 +268,9 @@ If you use this work in academic research, please cite:
 ```bibtex
 @software{cnc_digital_twin,
   title={CNC Spindle Digital Twin - Predictive Maintenance System},
-  author={[Your Name]},
+  author={Ghimire, Sujan and Khekare, Ganesh},
   year={2026},
-  url={[Repository URL]}
+  url={https://github.com/KRYSTALM7/digital-twin-predictive-maintenance}
 }
 ```
 
