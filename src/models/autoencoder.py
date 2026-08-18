@@ -47,12 +47,19 @@ def _standardize(data: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _build_autoencoder(input_dim: int) -> keras.Model:
+    """Build autoencoder with improved capacity for better anomaly detection.
+    
+    Architecture: 3 -> 32 -> 16 -> 4 (bottleneck) -> 16 -> 32 -> 3
+    Larger capacity allows the model to learn more complex patterns while
+    the 4-neuron bottleneck still provides sufficient compression for
+    anomaly detection on 3 input features.
+    """
     inputs = keras.Input(shape=(input_dim,))
-    x = layers.Dense(16, activation="relu")(inputs)
-    x = layers.Dense(8, activation="relu")(x)
-    bottleneck = layers.Dense(2, activation="relu", name="bottleneck")(x)
-    x = layers.Dense(8, activation="relu")(bottleneck)
+    x = layers.Dense(32, activation="relu")(inputs)
     x = layers.Dense(16, activation="relu")(x)
+    bottleneck = layers.Dense(4, activation="relu", name="bottleneck")(x)
+    x = layers.Dense(16, activation="relu")(bottleneck)
+    x = layers.Dense(32, activation="relu")(x)
     outputs = layers.Dense(input_dim, activation="linear")(x)
     model = keras.Model(inputs=inputs, outputs=outputs)
     model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-3), loss="mse")
@@ -63,8 +70,8 @@ def train_autoencoder(
     processed_csv_path: str = PROCESSED_CSV_PATH,
     model_output_path: str = MODEL_OUTPUT_PATH,
     meta_output_path: str = META_OUTPUT_PATH,
-    epochs: int = 50,
-    batch_size: int = 64,
+    epochs: int = 100,
+    batch_size: int = 32,
 ) -> str:
     # Train ONLY on the clean training split. Previously this loaded the
     # entire processed CSV (anomalies included), so the reconstruction-error
@@ -96,9 +103,19 @@ def train_autoencoder(
     # Threshold is now fit purely on clean-data reconstruction error —
     # this represents "how wrong the model is on normal operation", which
     # is the correct baseline for flagging anomalies on unseen (test) data.
+    # Using 2σ instead of 3σ for more sensitive detection.
     reconstructions = model.predict(standardized, verbose=0)
-    errors = np.mean(np.square(standardized - reconstructions), axis=1)
-    threshold = float(errors.mean() + 3 * errors.std())
+    reconstruction_diffs = standardized - reconstructions
+    
+    # Overall MSE per sample (for backward compatibility)
+    errors = np.mean(np.square(reconstruction_diffs), axis=1)
+    threshold = float(errors.mean() + 2 * errors.std())
+    
+    # Per-feature squared errors for feature-specific detection
+    feature_errors = np.square(reconstruction_diffs)  # shape: (n_samples, n_features)
+    feature_means = feature_errors.mean(axis=0)
+    feature_stds = feature_errors.std(axis=0)
+    feature_thresholds = feature_means + 2 * feature_stds
 
     out_dir = os.path.dirname(model_output_path)
     if out_dir:
@@ -110,6 +127,7 @@ def train_autoencoder(
         mean=mean,
         std=std,
         threshold=np.asarray([threshold], dtype=np.float32),
+        feature_thresholds=feature_thresholds.astype(np.float32),
         features=np.asarray(FEATURES),
     )
 
@@ -134,7 +152,14 @@ def detect_anomalies(
 ) -> dict:
     """Detect anomalies using trained autoencoder.
 
-    Returns dict with keys: errors (np.ndarray), threshold (float), mask (np.ndarray bool)
+    Returns dict with keys:
+    - errors: overall MSE per sample (np.ndarray)
+    - threshold: overall threshold (float)
+    - mask: overall anomaly mask (np.ndarray bool)
+    - feature_errors: per-feature squared errors (np.ndarray, shape: n_samples x n_features)
+    - feature_thresholds: per-feature thresholds (np.ndarray)
+    - feature_masks: per-feature anomaly masks (np.ndarray bool, shape: n_samples x n_features)
+    - feature_names: names of features in order (list of str)
     """
     if not os.path.exists(model_path) or not os.path.exists(meta_path):
         raise FileNotFoundError("Model or metadata not found. Train the autoencoder first.")
@@ -144,14 +169,36 @@ def detect_anomalies(
     mean = meta["mean"]
     std = meta["std"]
     threshold = float(meta["threshold"][0])
+    feature_thresholds = meta.get("feature_thresholds", None)
+    feature_names = [str(f) for f in meta["features"]]
 
     arr = _prepare_input(data)
     standardized = (arr - mean) / std
     reconstructions = model.predict(standardized, verbose=0)
-    errors = np.mean(np.square(standardized - reconstructions), axis=1)
+    reconstruction_diffs = standardized - reconstructions
+    
+    # Overall errors and mask
+    errors = np.mean(np.square(reconstruction_diffs), axis=1)
     mask = errors > threshold
+    
+    # Per-feature errors and masks
+    feature_errors = np.square(reconstruction_diffs)  # shape: (n_samples, n_features)
+    
+    if feature_thresholds is not None:
+        feature_masks = feature_errors > feature_thresholds[np.newaxis, :]
+    else:
+        # Fallback if trained with old version
+        feature_masks = np.zeros_like(feature_errors, dtype=bool)
 
-    return {"errors": errors, "threshold": threshold, "mask": mask}
+    return {
+        "errors": errors,
+        "threshold": threshold,
+        "mask": mask,
+        "feature_errors": feature_errors,
+        "feature_thresholds": feature_thresholds,
+        "feature_masks": feature_masks,
+        "feature_names": feature_names,
+    }
 
 
 if __name__ == "__main__":

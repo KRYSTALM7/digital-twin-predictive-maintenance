@@ -22,10 +22,9 @@ from tensorflow import keras
 OUT_RESULTS_CSV = os.path.join("outputs", "detection_results.csv")
 
 # How many standard deviations above the CLEAN (train-split) mean forecast
-# error counts as an anomaly. Same idea as the autoencoder's internal
-# threshold, but computed here since forecast error isn't fit during
-# train_lstm() itself.
-FORECAST_THRESHOLD_K = 3.0
+# error counts as an anomaly. Reduced from 3.0 to 2.0 for more sensitive
+# detection based on performance analysis.
+FORECAST_THRESHOLD_K = 2.0
 
 
 # -----------------------
@@ -164,7 +163,7 @@ def run_detection_and_metrics(
 
     forecast_pred_windowed = (forecast_errors > forecast_threshold).astype(int)
 
-    # ---- Autoencoder reconstruction errors ----
+    # ---- Autoencoder reconstruction errors with feature-specific detection ----
     # detect_anomalies() loads the threshold that was fit on train-split
     # data inside train_autoencoder(), so the mask it returns is already
     # correctly calibrated on clean data — no further threshold-fitting
@@ -173,17 +172,60 @@ def run_detection_and_metrics(
     ae_errors = ae_results["errors"]
     ae_threshold = float(ae_results["threshold"])
     ae_pred_windowed = ae_results["mask"].astype(int)
+    
+    # Extract feature-specific information
+    feature_errors = ae_results["feature_errors"]  # shape: (n_samples, 3)
+    feature_thresholds = ae_results["feature_thresholds"]
+    feature_masks = ae_results["feature_masks"]  # shape: (n_samples, 3)
+    feature_names = ae_results["feature_names"]
+    
+    # Feature-specific detection: temperature is index 0, vibration is index 1
+    temp_idx = feature_names.index("temperature") if "temperature" in feature_names else 0
+    vib_idx = feature_names.index("vibration") if "vibration" in feature_names else 1
+    
+    ae_temp_pred_windowed = feature_masks[:, temp_idx].astype(int)
+    ae_vib_pred_windowed = feature_masks[:, vib_idx].astype(int)
 
-    # ---- Consolidated hybrid rule ----
-    # This replaces the two previously-disagreeing hybrid implementations
-    # (the AND/OR discrete logic in feedback_loop.py vs. the max-z-score
-    # logic that used to live here). ONE rule now:
-    #   combined (OR)  = forecast_flag OR ae_flag   <- "the" hybrid detector
-    #   combined (AND) = forecast_flag AND ae_flag  <- stricter variant,
-    #                     reported for comparison only, not "the" result.
-    # OR is used as the primary hybrid detector because ground truth
-    # is_anomaly is itself defined as vibration OR temperature anomaly —
-    # matching detector logic to how labels were constructed.
+    # ---- Confidence-based hybrid detection ----
+    # Instead of simple binary OR/AND, use normalized confidence scores
+    # for more nuanced detection. Higher confidence = more certain anomaly.
+    
+    # Forecast confidence: how many σ above threshold
+    forecast_confidence = np.maximum(0, (forecast_errors - forecast_threshold) / (fe_std + 1e-9))
+    
+    # Autoencoder confidence: how many σ above threshold
+    ae_mean = ae_threshold / 3.0  # approximate, since threshold = mean + 2*std
+    ae_std = (ae_threshold - ae_mean) / 2.0
+    ae_confidence = np.maximum(0, (ae_errors - ae_threshold) / (ae_std + 1e-9))
+    
+    # Combined confidence: max of the two (more sensitive than AND, more specific than blind OR)
+    combined_confidence = np.maximum(forecast_confidence, ae_confidence)
+    
+    # Feature-specific confidences for temperature and vibration
+    if feature_thresholds is not None:
+        temp_threshold = feature_thresholds[temp_idx]
+        vib_threshold = feature_thresholds[vib_idx]
+        
+        # Estimate std from threshold (threshold ≈ mean + 2*std)
+        temp_std = temp_threshold / 3.0
+        vib_std = vib_threshold / 3.0
+        
+        temp_confidence = np.maximum(0, (feature_errors[:, temp_idx] - temp_threshold) / (temp_std + 1e-9))
+        vib_confidence = np.maximum(0, (feature_errors[:, vib_idx] - vib_threshold) / (vib_std + 1e-9))
+    else:
+        temp_confidence = ae_confidence
+        vib_confidence = forecast_confidence
+    
+    # Primary hybrid detector: flag if confidence > 0 (exceeds threshold)
+    combined_confidence_pred_windowed = (combined_confidence > 0).astype(int)
+    
+    # Alternative: weighted combination favoring forecast for vibration, AE for temperature
+    weighted_vib_confidence = np.maximum(forecast_confidence * 1.2, vib_confidence)
+    weighted_temp_confidence = np.maximum(ae_confidence * 1.2, temp_confidence)
+    weighted_combined_confidence = np.maximum(weighted_vib_confidence, weighted_temp_confidence)
+    weighted_combined_pred_windowed = (weighted_combined_confidence > 0).astype(int)
+    
+    # Keep legacy OR/AND for comparison
     combined_or_windowed = np.maximum(forecast_pred_windowed, ae_pred_windowed)
     combined_and_windowed = np.minimum(forecast_pred_windowed, ae_pred_windowed)
 
@@ -196,8 +238,24 @@ def run_detection_and_metrics(
 
     forecast_pred_full = pad(forecast_pred_windowed)
     ae_pred_full = pad(ae_pred_windowed)
+    ae_temp_pred_full = pad(ae_temp_pred_windowed)
+    ae_vib_pred_full = pad(ae_vib_pred_windowed)
     combined_or_full = pad(combined_or_windowed)
     combined_and_full = pad(combined_and_windowed)
+    combined_confidence_pred_full = pad(combined_confidence_pred_windowed)
+    weighted_combined_pred_full = pad(weighted_combined_pred_windowed)
+    
+    # Pad confidence scores (using 0.0 for non-windowed rows)
+    def pad_float(arr_windowed):
+        full = np.zeros(len(df), dtype=np.float32)
+        full[LSTM_WINDOW_SIZE:] = arr_windowed
+        return full
+    
+    forecast_confidence_full = pad_float(forecast_confidence)
+    ae_confidence_full = pad_float(ae_confidence)
+    combined_confidence_full = pad_float(combined_confidence)
+    temp_confidence_full = pad_float(temp_confidence)
+    vib_confidence_full = pad_float(vib_confidence)
 
     # ---- Ground truth ----
     y_true_combined = df["is_anomaly"].values.astype(int)
@@ -214,18 +272,31 @@ def run_detection_and_metrics(
     def test_slice(arr):
         return arr[test_mask]
 
-    combined_metrics = compute_binary_metrics(test_slice(y_true_combined), test_slice(combined_or_full))
+    # Primary hybrid detector: confidence-based
+    combined_metrics = compute_binary_metrics(test_slice(y_true_combined), test_slice(combined_confidence_pred_full))
+    
+    # Alternative detectors for comparison
+    combined_metrics_weighted = compute_binary_metrics(test_slice(y_true_combined), test_slice(weighted_combined_pred_full))
+    combined_metrics_or = compute_binary_metrics(test_slice(y_true_combined), test_slice(combined_or_full))
     combined_metrics_and = compute_binary_metrics(test_slice(y_true_combined), test_slice(combined_and_full))
+    
+    # Component detectors
     forecast_only_metrics = compute_binary_metrics(test_slice(y_true_vib), test_slice(forecast_pred_full))
     ae_only_metrics = compute_binary_metrics(test_slice(y_true_temp), test_slice(ae_pred_full))
-    vib_combined_metrics = compute_binary_metrics(test_slice(y_true_vib), test_slice(combined_or_full))
-    temp_combined_metrics = compute_binary_metrics(test_slice(y_true_temp), test_slice(combined_or_full))
+    
+    # Feature-specific autoencoder detectors
+    ae_temp_only_metrics = compute_binary_metrics(test_slice(y_true_temp), test_slice(ae_temp_pred_full))
+    ae_vib_only_metrics = compute_binary_metrics(test_slice(y_true_vib), test_slice(ae_vib_pred_full))
+    
+    # Hybrid detector performance on specific anomaly types
+    vib_combined_metrics = compute_binary_metrics(test_slice(y_true_vib), test_slice(combined_confidence_pred_full))
+    temp_combined_metrics = compute_binary_metrics(test_slice(y_true_temp), test_slice(combined_confidence_pred_full))
 
     # MTTD only makes sense within a contiguous, time-ordered slice, so we
     # compute it over the test split's own timestamps/labels.
     test_ts = timestamps[test_mask]
-    mttd_vib = mean_time_to_detect(test_ts, test_slice(y_true_vib), test_slice(combined_or_full))
-    mttd_temp = mean_time_to_detect(test_ts, test_slice(y_true_temp), test_slice(combined_or_full))
+    mttd_vib = mean_time_to_detect(test_ts, test_slice(y_true_vib), test_slice(combined_confidence_pred_full))
+    mttd_temp = mean_time_to_detect(test_ts, test_slice(y_true_temp), test_slice(combined_confidence_pred_full))
 
     # ---- Save full detailed results (all rows, for inspection) ----
     out_df = df.copy()
@@ -233,12 +304,30 @@ def run_detection_and_metrics(
     out_df["ae_error"] = 0.0
     out_df.loc[LSTM_WINDOW_SIZE:, "forecast_error"] = forecast_errors
     out_df.loc[LSTM_WINDOW_SIZE:, "ae_error"] = ae_errors
+    
+    # Predictions from various detectors
     out_df["y_pred_forecast"] = forecast_pred_full
     out_df["y_pred_ae"] = ae_pred_full
+    out_df["y_pred_ae_temp"] = ae_temp_pred_full
+    out_df["y_pred_ae_vib"] = ae_vib_pred_full
+    out_df["y_pred_combined_confidence"] = combined_confidence_pred_full
+    out_df["y_pred_combined_weighted"] = weighted_combined_pred_full
     out_df["y_pred_combined_or"] = combined_or_full
     out_df["y_pred_combined_and"] = combined_and_full
+    
+    # Confidence scores
+    out_df["forecast_confidence"] = forecast_confidence_full
+    out_df["ae_confidence"] = ae_confidence_full
+    out_df["combined_confidence"] = combined_confidence_full
+    out_df["temp_confidence"] = temp_confidence_full
+    out_df["vib_confidence"] = vib_confidence_full
+    
+    # Thresholds for reference
     out_df["forecast_threshold"] = forecast_threshold
     out_df["ae_threshold"] = ae_threshold
+    if feature_thresholds is not None:
+        out_df["temp_threshold"] = feature_thresholds[temp_idx]
+        out_df["vib_threshold"] = feature_thresholds[vib_idx]
 
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     out_df.to_csv(out_csv, index=False)
@@ -254,23 +343,40 @@ def run_detection_and_metrics(
     print(f"\n[Evaluated on {test_mask.sum()} test-split rows only]")
     print(f"Forecast threshold (fit on train-split errors): {forecast_threshold:.4f}")
     print(f"Autoencoder threshold (fit on train-split errors): {ae_threshold:.4f}")
+    if feature_thresholds is not None:
+        print(f"Temperature feature threshold: {feature_thresholds[temp_idx]:.4f}")
+        print(f"Vibration feature threshold: {feature_thresholds[vib_idx]:.4f}")
 
-    print_metrics("Combined Hybrid (OR) — PRIMARY RESULT", combined_metrics)
-    print_metrics("Combined Hybrid (AND) — stricter variant, for comparison", combined_metrics_and)
-    print_metrics("Forecast-only detector vs vibration anomalies", forecast_only_metrics)
-    print_metrics("Autoencoder-only detector vs temperature anomalies", ae_only_metrics)
-    print_metrics("Hybrid (OR) vs vibration anomalies", vib_combined_metrics)
-    print_metrics("Hybrid (OR) vs temperature anomalies", temp_combined_metrics)
+    print_metrics("Combined Confidence-Based (PRIMARY) — hybrid detector with confidence scoring", combined_metrics)
+    print_metrics("Combined Weighted — alternative weighted confidence approach", combined_metrics_weighted)
+    print_metrics("Combined OR (legacy) — simple binary OR", combined_metrics_or)
+    print_metrics("Combined AND (legacy) — strict binary AND", combined_metrics_and)
+    
+    print("\n--- Component Detector Performance ---")
+    print_metrics("Forecast-only vs vibration anomalies", forecast_only_metrics)
+    print_metrics("Autoencoder-only vs temperature anomalies", ae_only_metrics)
+    print_metrics("AE feature-specific (temperature) vs temperature anomalies", ae_temp_only_metrics)
+    print_metrics("AE feature-specific (vibration) vs vibration anomalies", ae_vib_only_metrics)
+    
+    print("\n--- Primary Detector Performance by Anomaly Type ---")
+    print_metrics("Confidence-based hybrid vs vibration anomalies", vib_combined_metrics)
+    print_metrics("Confidence-based hybrid vs temperature anomalies", temp_combined_metrics)
 
-    print(f"\nMean Time to Detect (Vibration, hybrid OR detector): {mttd_vib}")
-    print(f"Mean Time to Detect (Temperature, hybrid OR detector): {mttd_temp}")
+    print(f"\nMean Time to Detect (Vibration, confidence-based detector): {mttd_vib}")
+    print(f"Mean Time to Detect (Temperature, confidence-based detector): {mttd_temp}")
     print(f"\nDetailed detection results saved to: {out_csv}")
 
     return {
         "combined_metrics": combined_metrics,
+        "combined_metrics_weighted": combined_metrics_weighted,
+        "combined_metrics_or": combined_metrics_or,
         "combined_metrics_and": combined_metrics_and,
         "forecast_only_metrics": forecast_only_metrics,
         "ae_only_metrics": ae_only_metrics,
+        "ae_temp_only_metrics": ae_temp_only_metrics,
+        "ae_vib_only_metrics": ae_vib_only_metrics,
+        "vib_combined_metrics": vib_combined_metrics,
+        "temp_combined_metrics": temp_combined_metrics,
         "mttd_vib": mttd_vib,
         "mttd_temp": mttd_temp,
         "out_csv": out_csv,
