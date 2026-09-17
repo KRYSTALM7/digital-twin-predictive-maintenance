@@ -1,14 +1,7 @@
 import os
 import csv
 import random
-from google import genai
-import json
 from typing import List, Dict, Any
-from dotenv import load_dotenv
-
-load_dotenv()
-
-load_dotenv()
 
 RAW_CSV_PATH = os.path.join("data", "raw", "simulated_spindle_data.csv")
 PROCESSED_CSV_PATH = os.path.join("data", "processed", "spindle_data_with_anomalies.csv")
@@ -17,13 +10,6 @@ PROCESSED_CSV_PATH = os.path.join("data", "processed", "spindle_data_with_anomal
 # NEVER anomaly-injected — it represents "known normal" operation, which is
 # what the LSTM/autoencoder thresholds should be calibrated against.
 TRAIN_FRACTION = 0.7
-
-# Sanity bounds for any anomaly severity, whether it comes from the random
-# fallback or from a Gemini-proposed plan. This stops an LLM (or a bad
-# random draw) from producing an absurd, non-reproducible anomaly magnitude.
-MAX_TEMP_DRIFT_TOTAL = 8.0   # degrees C, matches random fallback's upper bound
-MIN_TEMP_DRIFT_TOTAL = 3.0
-VIBRATION_FACTOR_RANGE = (3.0, 5.0)  # unchanged from original
 
 
 def _ensure_dir(path: str) -> None:
@@ -37,51 +23,6 @@ def _load_csv(path: str) -> List[Dict[str, Any]]:
         for row in reader:
             rows.append(row)
     return rows
-
-
-def _get_genai_anomaly_plan_gemini(data: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Uses Gemini to decide anomaly injection windows (indices relative to
-    the slice of data passed in — i.e. the TEST portion only, see below)."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    print("Loaded key:", api_key is not None)
-
-    if not api_key:
-        print("[WARN] No GEMINI_API_KEY found. Using random anomalies.")
-        return {}
-
-    client = genai.Client(api_key=api_key)
-
-    preview = data[:200]
-
-    prompt = (
-        "You are a predictive maintenance expert. Based on the CNC spindle sensor data, "
-        "propose anomaly injection windows.\n"
-        "Respond ONLY in pure JSON. No backticks. No text. No explanation.\n\n"
-        "Return format:\n"
-        "{\n"
-        "  \"vibration_spikes\": [[start, length], ...],\n"
-        "  \"temperature_drifts\": [[start, length, total_change], ...]\n"
-        "}\n\n"
-        f"DATA:\n{preview}"
-    )
-
-    try:
-        # gemini-flash-latest is an auto-updating alias maintained by Google,
-        # so this keeps working as models are retired/replaced upstream
-        # (as of July 2026 it points to Gemini 3.5/3.6 Flash).
-        response = client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=prompt,
-        )
-        text = response.text.strip()
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start == -1 or end == -1:
-            raise ValueError("No JSON object found in response")
-        return json.loads(text[start:end])
-    except Exception as e:
-        print("[ERROR] Gemini request failed. Falling back to random logic.", e)
-        return {}
 
 
 def _coerce_row_types(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -162,14 +103,25 @@ def _split_train_test(data: List[Dict[str, Any]], train_fraction: float = TRAIN_
 
 def inject_anomalies(
     data: List[Dict[str, Any]],
-    method: str = "genai",
-    seed: int | None = 42,
+    method: str = "physics",  # Changed from "genai" to "physics"
+    seed: int = 42,
 ) -> List[Dict[str, Any]]:
-    """Inject anomalies ONLY into rows already marked split == 'test'.
-    `data` here is expected to be the full dataset (with 'split' column set);
-    train rows are passed through untouched."""
-    if seed is not None:
-        random.seed(seed)
+    """Inject physically motivated anomalies ONLY into rows marked split == 'test'.
+    
+    Physics-based fault types:
+    1. Bearing wear: gradual coupled temp+vib increase (realistic degradation)
+    2. Cooling failure: temperature drift without vibration (thermal system fault)
+    3. Sudden imbalance: vibration spike + slight temp (mechanical fault)
+    
+    This replaces random/LLM-based injection with physically meaningful faults
+    that reflect real spindle failure modes.
+    
+    Args:
+        data: List of data rows with 'split' column
+        method: Anomaly injection method (currently only 'physics' supported)
+        seed: Random seed for reproducibility (default: 42)
+    """
+    random.seed(seed)
 
     augmented = [dict(r) for r in data]
     test_indices = [i for i, r in enumerate(augmented) if r.get("split") == "test"]
@@ -180,83 +132,92 @@ def inject_anomalies(
     def clamp(value: float, min_v: float, max_v: float) -> float:
         return max(min_v, min(value, max_v))
 
-    def clamp_drift_total(total: float) -> float:
-        # Preserve sign (drift can be negative) but bound magnitude so a
-        # bad LLM response can't produce an unrealistic swing.
-        sign = 1.0 if total >= 0 else -1.0
-        mag = clamp(abs(total), MIN_TEMP_DRIFT_TOTAL, MAX_TEMP_DRIFT_TOTAL)
-        return sign * mag
-
-    # test_indices maps a "local" position within the test slice to the
-    # actual row index in `augmented`. Gemini only ever sees the test slice.
-    test_rows_only = [augmented[i] for i in test_indices]
-
-    if method == "genai":
-        plan = _get_genai_anomaly_plan_gemini(test_rows_only)
-
-        if plan:
-            print("[INFO] Injecting anomalies using Gemini plan (test split only).")
-
-            for start, length in plan.get("vibration_spikes", []):
-                start = int(start)
-                length = int(length)
-                for local_i in range(start, min(n_test, start + length)):
-                    real_i = test_indices[local_i]
-                    vib = float(augmented[real_i]["vibration"])
-                    factor = random.uniform(*VIBRATION_FACTOR_RANGE)
-                    augmented[real_i]["vibration"] = clamp(vib * factor, 0.0, 5.0)
-                    augmented[real_i]["is_anomaly"] = 1
-                    augmented[real_i]["is_vibration_anomaly"] = 1
-
-            for start, length, drift_total in plan.get("temperature_drifts", []):
-                start = int(start)
-                length = int(length)
-                drift_total = clamp_drift_total(float(drift_total))
-                step = drift_total / max(1, length - 1)
-                delta = 0.0
-                for local_i in range(start, min(n_test, start + length)):
-                    real_i = test_indices[local_i]
-                    temp = float(augmented[real_i]["temperature"])
-                    augmented[real_i]["temperature"] = clamp(temp + delta, -50.0, 300.0)
-                    delta += step
-                    augmented[real_i]["is_anomaly"] = 1
-                    augmented[real_i]["is_temperature_anomaly"] = 1
-
-            return augmented
-
-        print("[WARN] Gemini returned no plan. Defaulting to random anomalies.")
+    print(f"[INFO] Injecting physics-based anomalies into {n_test} test rows.")
 
     # -----------------------------
-    # Random fallback (test split only)
+    # Fault Type 1: Bearing Wear (Coupled, Gradual)
+    # Physically realistic: bearing degradation causes both friction (heat) and vibration
     # -----------------------------
-    num_spike_windows = max(1, n_test // 250)
-    num_drift_windows = max(1, n_test // 300)
-
-    for _ in range(num_spike_windows):
-        start = random.randint(0, max(0, n_test - 3))
-        length = random.randint(2, 6)
-        for local_i in range(start, min(n_test, start + length)):
-            real_i = test_indices[local_i]
-            vib = float(augmented[real_i]["vibration"])
-            factor = random.uniform(*VIBRATION_FACTOR_RANGE)
-            augmented[real_i]["vibration"] = clamp(vib * factor, 0.0, 5.0)
-            augmented[real_i]["is_anomaly"] = 1
-            augmented[real_i]["is_vibration_anomaly"] = 1
-
-    for _ in range(num_drift_windows):
-        start = random.randint(0, max(0, n_test - 15))
-        length = random.randint(10, 30)
-        drift_total = clamp_drift_total(random.uniform(MIN_TEMP_DRIFT_TOTAL, MAX_TEMP_DRIFT_TOTAL))
-        step = drift_total / max(1, length - 1)
-        delta = 0.0
-        for local_i in range(start, min(n_test, start + length)):
-            real_i = test_indices[local_i]
+    num_bearing_faults = max(1, n_test // 400)
+    print(f"[INFO] Injecting {num_bearing_faults} bearing wear fault(s)")
+    
+    for _ in range(num_bearing_faults):
+        start = random.randint(0, max(0, n_test - 40))
+        length = random.randint(25, 45)  # Longer duration for gradual fault
+        
+        for offset in range(length):
+            if start + offset >= n_test:
+                break
+            real_i = test_indices[start + offset]
+            progress = offset / (length - 1)  # 0 to 1
+            
+            # Coupled increase: both temperature and vibration rise together
             temp = float(augmented[real_i]["temperature"])
-            augmented[real_i]["temperature"] = clamp(temp + delta, -50.0, 300.0)
-            delta += step
+            vib = float(augmented[real_i]["vibration"])
+            
+            # Gradual temperature increase (4-8°C over duration)
+            temp_increase = progress * random.uniform(4.0, 8.0)
+            # Gradual vibration increase (1.8-3.0x over duration)
+            vib_factor = 1.0 + progress * random.uniform(0.8, 2.0)
+            
+            augmented[real_i]["temperature"] = clamp(temp + temp_increase, -50.0, 300.0)
+            augmented[real_i]["vibration"] = clamp(vib * vib_factor, 0.0, 5.0)
             augmented[real_i]["is_anomaly"] = 1
             augmented[real_i]["is_temperature_anomaly"] = 1
+            augmented[real_i]["is_vibration_anomaly"] = 1
 
+    # -----------------------------
+    # Fault Type 2: Cooling System Failure (Temperature Only)
+    # Physically realistic: thermal system degrades, mechanical system unaffected
+    # -----------------------------
+    num_cooling_faults = max(1, n_test // 450)
+    print(f"[INFO] Injecting {num_cooling_faults} cooling failure fault(s)")
+    
+    for _ in range(num_cooling_faults):
+        start = random.randint(0, max(0, n_test - 35))
+        length = random.randint(20, 40)
+        drift_total = random.uniform(5.0, 10.0)  # 5-10°C drift
+        
+        for offset in range(length):
+            if start + offset >= n_test:
+                break
+            real_i = test_indices[start + offset]
+            progress = offset / (length - 1)
+            
+            temp = float(augmented[real_i]["temperature"])
+            augmented[real_i]["temperature"] = clamp(temp + drift_total * progress, -50.0, 300.0)
+            augmented[real_i]["is_anomaly"] = 1
+            augmented[real_i]["is_temperature_anomaly"] = 1
+            # Vibration remains normal (cooling failure doesn't affect mechanical balance)
+
+    # -----------------------------
+    # Fault Type 3: Sudden Imbalance (Vibration Spike + Slight Temp)
+    # Physically realistic: mechanical imbalance causes immediate vibration, slight friction increase
+    # -----------------------------
+    num_imbalance_faults = max(1, n_test // 350)
+    print(f"[INFO] Injecting {num_imbalance_faults} imbalance fault(s)")
+    
+    for _ in range(num_imbalance_faults):
+        start = random.randint(0, max(0, n_test - 10))
+        length = random.randint(3, 10)
+        
+        for offset in range(length):
+            if start + offset >= n_test:
+                break
+            real_i = test_indices[start + offset]
+            
+            vib = float(augmented[real_i]["vibration"])
+            temp = float(augmented[real_i]["temperature"])
+            
+            # Sharp vibration increase (3.5-5.5x)
+            augmented[real_i]["vibration"] = clamp(vib * random.uniform(3.5, 5.5), 0.0, 5.0)
+            # Slight temperature increase from additional friction (1-3°C)
+            augmented[real_i]["temperature"] = clamp(temp + random.uniform(1.0, 3.0), -50.0, 300.0)
+            augmented[real_i]["is_anomaly"] = 1
+            augmented[real_i]["is_vibration_anomaly"] = 1
+            # Temperature increase is minor, don't mark as temperature anomaly unless you want to
+
+    print(f"[INFO] Physics-based anomaly injection complete.")
     return augmented
 
 
@@ -286,14 +247,25 @@ def _save_csv(path: str, rows: List[Dict[str, Any]]) -> None:
 def preprocess_data(
     raw_csv_path: str = RAW_CSV_PATH,
     processed_csv_path: str = PROCESSED_CSV_PATH,
-    anomaly_method: str = "genai",
+    anomaly_method: str = "physics",  # Changed default to "physics"
     train_fraction: float = TRAIN_FRACTION,
+    seed: int = 42,
 ) -> str:
     """Run full preprocessing pipeline and save processed CSV.
 
     Adds a 'split' column ('train' / 'test'). Only the test portion ever
     receives injected anomalies, so downstream model thresholds trained on
     split == 'train' are calibrated on clean data only.
+    
+    Now uses physics-based anomaly injection by default for more realistic
+    fault patterns.
+    
+    Args:
+        raw_csv_path: Path to raw simulation data
+        processed_csv_path: Path to save processed data
+        anomaly_method: Anomaly injection method ('physics')
+        train_fraction: Fraction of data for training (default: 0.7)
+        seed: Random seed for reproducible anomaly generation (default: 42)
     """
     data = _load_csv(raw_csv_path)
     data = _clean_missing_values(data)
@@ -303,7 +275,7 @@ def preprocess_data(
 
     print(f"[INFO] Train rows: {split_idx} | Test rows: {len(data) - split_idx}")
 
-    data = inject_anomalies(data, method=anomaly_method)
+    data = inject_anomalies(data, method=anomaly_method, seed=seed)
 
     out_dir = os.path.dirname(processed_csv_path)
     if out_dir:

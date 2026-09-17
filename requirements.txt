@@ -1,7 +1,7 @@
-google-genai
 tensorflow
 simpy
 numpy
-python-dotenv
-
-
+pandas
+scikit-learn
+matplotlib
+seaborn
